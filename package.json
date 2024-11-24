@@ -1,0 +1,10 @@
+{
+    "name": "ffmpeg-converter",
+    "version": "1.0.0",
+    "description": "AWS Lambda function with FFmpeg and Pub/Sub",
+    "main": "index.js",
+    "dependencies": {
+        "@google-cloud/pubsub": "^4.9.0",
+        "aws-sdk": "^2.1692.0"
+    }
+}
