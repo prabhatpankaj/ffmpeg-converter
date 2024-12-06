@@ -1,10 +1,22 @@
 const AWS = require("aws-sdk");
+const AWSR2 = require("aws-sdk"); 
 const { PubSub } = require("@google-cloud/pubsub");
 const fs = require("fs");
 const path = require("path");
 const { exec } = require("child_process");
 
+// S3 client
 const s3 = new AWS.S3();
+
+// Cloudflare R2 client
+const r2 = new AWSR2.S3({
+    endpoint: process.env.R2_ENDPOINT, // Set the R2 endpoint explicitly
+    accessKeyId: process.env.R2_ACCESS_KEY, // Provide the access key
+    secretAccessKey: process.env.R2_SECRET_KEY, // Provide the secret key
+    s3ForcePathStyle: true, // Required for R2 compatibility
+    signatureVersion: 'v4', // Use signature version 4 for authentication
+    region: "auto"
+  });
 
 // Set environment variables
 const PROJECT_ID = process.env.PROJECT_ID;
@@ -99,45 +111,40 @@ exports.handler = async (event) => {
             fs.mkdirSync(TEMP_OUTPUT_DIR);
         }
 
-        // FFmpeg command
+        // FFmpeg resolutions and processing
         const resolutions = [
-            { name: "1080p", width: 1920, height: 1080, bitrate: "5000k" },
-            { name: "720p", width: 1280, height: 720, bitrate: "3000k" },
+            // { name: "1080p", width: 1920, height: 1080, bitrate: "5000k" },
+            // { name: "720p", width: 1280, height: 720, bitrate: "3000k" },
             { name: "480p", width: 854, height: 480, bitrate: "1500k" },
         ];
 
         const playlists = [];
         for (const res of resolutions) {
             const playlist = path.join(TEMP_OUTPUT_DIR, `${res.name}.m3u8`);
-            playlists.push({ name: res.name, bitrate: res.bitrate, playlist });
+            playlists.push({ name: res.name, bitrate: res.bitrate, playlist, ...res });
 
-            try {
-                const segmentFilename = path.join(TEMP_OUTPUT_DIR, `${res.name}_%03d.ts`);
-                const command = `${FFMPEG_PATH} -i ${TEMP_INPUT_FILE} \
-                    -vf "scale=w=trunc(iw*min(1\\,min(${res.width}/iw\\,${res.height}/ih))):h=trunc(ih*min(1\\,min(${res.width}/iw\\,${res.height}/ih))):force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2" \
-                    -c:a aac -ar 48000 -b:a 128k \
-                    -c:v h264 -profile:v main -preset veryslow -tune film -crf 23 \
-                    -sc_threshold 0 -g 48 -keyint_min 48 \
-                    -hls_time 4 -hls_playlist_type vod \
-                    -b:v ${res.bitrate} -maxrate ${res.bitrate} -bufsize ${parseInt(res.bitrate) / 2} \
-                    -hls_segment_filename ${segmentFilename} ${playlist}`;
+            const segmentFilename = path.join(TEMP_OUTPUT_DIR, `${res.name}_%03d.ts`);
+            const command = `${FFMPEG_PATH} -i ${TEMP_INPUT_FILE} \
+                -vf "scale=w=trunc(iw*min(1\\,min(${res.width}/iw\\,${res.height}/ih))):h=trunc(ih*min(1\\,min(${res.width}/iw\\,${res.height}/ih))):force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2" \
+                -c:a aac -ar 48000 -b:a 128k \
+                -c:v h264 -profile:v main -preset veryslow -tune film -crf 23 \
+                -sc_threshold 0 -g 48 -keyint_min 48 \
+                -hls_time 4 -hls_playlist_type vod \
+                -b:v ${res.bitrate} -maxrate ${res.bitrate} -bufsize ${parseInt(res.bitrate) / 2} \
+                -hls_segment_filename ${segmentFilename} ${playlist}`;
 
-                await new Promise((resolve, reject) => {
-                    exec(command, (error, stdout, stderr) => {
-                        if (error) {
-                            console.error(`FFmpeg error for ${res.name}:`, stderr);
-                            return reject(error);
-                        }
-                        console.log(`FFmpeg output for ${res.name}:`, stdout);
-                        resolve();
-                    });
+            await new Promise((resolve, reject) => {
+                exec(command, (error, stdout, stderr) => {
+                    if (error) {
+                        console.error(`FFmpeg error for ${res.name}:`, stderr);
+                        return reject(error);
+                    }
+                    console.log(`FFmpeg output for ${res.name}:`, stdout);
+                    resolve();
                 });
+            });
 
-                console.log(`HLS conversion successful for ${res.name}`);
-            } catch (error) {
-                console.error(`Error during FFmpeg execution for ${res.name}:`, error.message);
-                throw error;
-            }
+            console.log(`HLS conversion successful for ${res.name}`);
         }
 
         // Create the master playlist
@@ -154,12 +161,13 @@ exports.handler = async (event) => {
         fs.writeFileSync(masterPlaylistPath, `#EXTM3U\n#EXT-X-VERSION:3\n${masterPlaylist}`);
         console.log("Master playlist created at", masterPlaylistPath);
 
-        // Upload HLS files back to S3
+        // Upload HLS files back to S3 and Cloudflare R2
         const files = fs.readdirSync(TEMP_OUTPUT_DIR);
         for (const file of files) {
             const filePath = path.join(TEMP_OUTPUT_DIR, file);
             const s3Key = path.join(targetPrefix, file);
 
+            // Upload to S3
             await s3
                 .upload({
                     Bucket: targetBucket,
@@ -167,14 +175,23 @@ exports.handler = async (event) => {
                     Body: fs.createReadStream(filePath),
                 })
                 .promise();
-
             console.log(`Uploaded ${filePath} to s3://${targetBucket}/${s3Key}`);
+
+            // Upload to R2
+            await r2
+                .upload({
+                    Bucket: process.env.R2_BUCKET,
+                    Key: s3Key,
+                    Body: fs.createReadStream(filePath),
+                })
+                .promise();
+            console.log(`Uploaded ${filePath} to R2: ${process.env.R2_BUCKET}/${s3Key}`);
         }
 
         // Publish response to Pub/Sub
         const response = {
             statusCode: 200,
-            message: "MP4 successfully converted to HLS and uploaded",
+            message: "MP4 successfully converted to HLS and uploaded to S3 and R2",
             uniqueKey: uniqueKey,
             masterPlaylist: `${CLOUDFRONT_URL}/${uniqueKey}/${baseFilename}/master.m3u8`,
         };
